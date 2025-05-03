@@ -1,0 +1,21 @@
+# Exclude data and output directories
+/data
+/patches
+/features
+
+# Exclude large image and array files
+*.npy
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+
+# Exclude logs and other unnecessary files
+*.log
+
+# Exclude any other user-specific or temp files
+.DS_Store
+Thumbs.db 

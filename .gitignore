@@ -1,0 +1,14 @@
+data/
+patches/
+features/
+*.npy
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.log
+.DS_Store
+Thumbs.db
