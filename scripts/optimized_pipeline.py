@@ -115,7 +115,7 @@ def optimize_feature_extraction(patches: List[np.ndarray],
                     
                     # Apply FCM and PCA
                     cluster_features = fcm.extract_features(combined_features)
-                    reduced_features = pca.reduce_dimensions(cluster_features)
+                    reduced_features = pca.fit_transform(cluster_features)
                     
                     # Evaluate with simple classifier
                     from sklearn.linear_model import LogisticRegression
@@ -217,7 +217,7 @@ def main():
             
             # Apply FCM and PCA
             cluster_features = fcm.extract_features(combined_features)
-            reduced_features = pca.reduce_dimensions(cluster_features)
+            reduced_features = pca.fit_transform(cluster_features)
             
             # Save features
             features_path = os.path.join(args.output_dir, 'features', 
@@ -230,4 +230,4 @@ def main():
     logger.info("Pipeline completed successfully")
 
 if __name__ == '__main__':
-    main() 
+    main()

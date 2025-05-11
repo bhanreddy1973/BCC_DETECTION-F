@@ -4,27 +4,34 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                            f1_score, roc_auc_score, confusion_matrix)
 import matplotlib.pyplot as plt
 import seaborn as sns
+from pathlib import Path
+import tensorflow as tf
 
-def calculate_metrics(y_true: np.ndarray,
-                    y_pred: np.ndarray,
-                    y_prob: np.ndarray) -> Dict:
+def calculate_metrics(model: tf.keras.Model,
+                    X: np.ndarray,
+                    y_true: np.ndarray) -> Dict:
     """
     Calculate classification metrics
     
     Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        y_prob: Predicted probabilities
+        model: Trained model
+        X: Input features
+        y_true: True labels (one-hot encoded)
         
     Returns:
         Dictionary of metrics
     """
+    # Get model predictions
+    y_pred = model.predict(X)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    y_true_classes = np.argmax(y_true, axis=1)
+    
     metrics = {
-        'accuracy': accuracy_score(y_true, y_pred),
-        'precision': precision_score(y_true, y_pred),
-        'recall': recall_score(y_true, y_pred),
-        'f1': f1_score(y_true, y_pred),
-        'roc_auc': roc_auc_score(y_true, y_prob)
+        'accuracy': accuracy_score(y_true_classes, y_pred_classes),
+        'precision': precision_score(y_true_classes, y_pred_classes, average='weighted'),
+        'recall': recall_score(y_true_classes, y_pred_classes, average='weighted'),
+        'f1': f1_score(y_true_classes, y_pred_classes, average='weighted'),
+        'roc_auc': roc_auc_score(y_true, y_pred, average='weighted', multi_class='ovo')
     }
     return metrics
 
@@ -137,4 +144,56 @@ def generate_evaluation_report(patch_metrics: Dict,
         f.write("\nImage-Level Performance\n")
         f.write("----------------------\n")
         for metric, value in image_metrics.items():
-            f.write(f"{metric}: {value:.4f}\n") 
+            f.write(f"{metric}: {value:.4f}\n")
+
+def plot_training_curves(history: Dict,
+                        output_dir: str = 'data/visualizations/training') -> None:
+    """
+    Plot training curves from model history
+    
+    Args:
+        history: Training history dictionary containing metrics
+        output_dir: Directory to save the plots
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Plot loss curves
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['loss'], label='Training Loss')
+    if 'val_loss' in history:
+        plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{output_dir}/loss_curves.png', bbox_inches='tight', dpi=300)
+    plt.close()
+    
+    # Plot accuracy curves
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['accuracy'], label='Training Accuracy')
+    if 'val_accuracy' in history:
+        plt.plot(history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Model Accuracy Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{output_dir}/accuracy_curves.png', bbox_inches='tight', dpi=300)
+    plt.close()
+    
+    # Plot other metrics if available
+    for metric in ['precision', 'recall', 'f1', 'auc']:
+        if metric in history:
+            plt.figure(figsize=(10, 6))
+            plt.plot(history[metric], label=f'Training {metric.upper()}')
+            if f'val_{metric}' in history:
+                plt.plot(history[f'val_{metric}'], label=f'Validation {metric.upper()}')
+            plt.title(f'Model {metric.upper()} Over Time')
+            plt.xlabel('Epoch')
+            plt.ylabel(metric.upper())
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(f'{output_dir}/{metric}_curves.png', bbox_inches='tight', dpi=300)
+            plt.close()

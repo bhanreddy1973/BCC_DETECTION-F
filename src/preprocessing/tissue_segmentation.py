@@ -1,160 +1,196 @@
-import numpy as np
-from skimage import io, color, morphology, measure
-from skimage.filters import threshold_otsu
-from sklearn.model_selection import KFold
+import os
 import cv2
-from typing import Tuple, List, Dict
+import numpy as np
+import tifffile as tiff
 import logging
+from pathlib import Path
+from typing import Tuple, Optional
+import pandas as pd
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class TissueSegmenter:
     def __init__(self, 
-                 min_tissue_threshold: float = 0.7,
-                 patch_size: int = 224,
-                 patch_overlap: float = 0.5,
-                 n_folds: int = 5):
+                 otsu_threshold: Optional[int] = None,
+                 min_tissue_area: int = 1000,
+                 kernel_size: int = 5,
+                 visualizer = None):
         """
-        Initialize tissue segmenter with configurable parameters
+        Initialize the tissue segmenter.
         
         Args:
-            min_tissue_threshold: Minimum tissue content in patch (0-1)
-            patch_size: Size of extracted patches
-            patch_overlap: Overlap between patches (0-1)
-            n_folds: Number of folds for cross-validation
+            otsu_threshold: Optional manual threshold value. If None, Otsu's method will be used.
+            min_tissue_area: Minimum area of tissue regions to keep (in pixels)
+            kernel_size: Size of the morphological operation kernel
+            visualizer: PipelineVisualizer instance for visualization
         """
-        self.min_tissue_threshold = min_tissue_threshold
-        self.patch_size = patch_size
-        self.patch_overlap = patch_overlap
-        self.n_folds = n_folds
-        self.logger = logging.getLogger(__name__)
+        self.otsu_threshold = otsu_threshold
+        self.min_tissue_area = min_tissue_area
+        self.kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        self.visualizer = visualizer
 
-    def segment_tissue(self, image: np.ndarray) -> np.ndarray:
-        """
-        Segment tissue from background using color deconvolution and Otsu's thresholding
+    def load_image(self, image_path: str) -> Optional[np.ndarray]:
+        """Load a TIFF image with error handling."""
+        try:
+            image = tiff.imread(image_path)
+            if image is None:
+                logger.error(f"Failed to load image: {image_path}")
+                return None
+            return image
+        except Exception as e:
+            logger.error(f"Error loading image {image_path}: {str(e)}")
+            return None
+
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess the image for tissue segmentation."""
+        # Convert to grayscale if needed
+        if len(image.shape) > 2:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         
-        Args:
-            image: Input RGB image
-            
-        Returns:
-            Binary mask of tissue regions
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        
+        return blurred
+
+    def segment_tissue(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
         """
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        Segment tissue regions from the image.
+        
+        Returns:
+            Tuple containing:
+            - Binary mask of tissue regions
+            - Threshold value used
+        """
+        # Preprocess image
+        processed = self.preprocess_image(image)
         
         # Apply Otsu's thresholding
-        thresh = threshold_otsu(gray)
-        binary = gray > thresh
+        if self.otsu_threshold is None:
+            threshold, binary = cv2.threshold(processed, 0, 255, 
+                                           cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            threshold = self.otsu_threshold
+            _, binary = cv2.threshold(processed, threshold, 255, cv2.THRESH_BINARY)
         
-        # Morphological operations
-        binary = morphology.binary_closing(binary, morphology.disk(5))
-        binary = morphology.binary_opening(binary, morphology.disk(5))
+        # Invert the binary image (tissue should be white)
+        binary = cv2.bitwise_not(binary)
+        
+        # Apply morphological operations
+        mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         
         # Remove small objects
-        binary = morphology.remove_small_objects(binary, min_size=500)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        mask = np.zeros_like(mask)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= self.min_tissue_area:
+                mask[labels == i] = 255
         
-        return binary
+        return mask, threshold
 
-    def extract_patches(self, 
-                       image: np.ndarray, 
-                       mask: np.ndarray) -> Tuple[List[np.ndarray], List[Tuple[int, int]]]:
-        """
-        Extract patches from image with tissue mask
+    def process_image(self, image_path: str, output_dir: str, label: str, split: str) -> Optional[dict]:
+        """Process a single image and save the tissue mask."""
+        # Load image
+        image = self.load_image(image_path)
+        if image is None:
+            return None
         
-        Args:
-            image: Input RGB image
-            mask: Binary tissue mask
-            
-        Returns:
-            List of patches and their coordinates
-        """
-        patches = []
-        coordinates = []
+        # Segment tissue
+        mask, threshold = self.segment_tissue(image)
         
-        stride = int(self.patch_size * (1 - self.patch_overlap))
+        # Save mask
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        mask_name = f"{base_name}_mask.tif"
+        mask_path = os.path.join(output_dir, split, label, mask_name)
         
-        for y in range(0, image.shape[0] - self.patch_size + 1, stride):
-            for x in range(0, image.shape[1] - self.patch_size + 1, stride):
-                patch = image[y:y+self.patch_size, x:x+self.patch_size]
-                patch_mask = mask[y:y+self.patch_size, x:x+self.patch_size]
-                
-                # Check tissue content
-                tissue_ratio = np.mean(patch_mask)
-                if tissue_ratio >= self.min_tissue_threshold:
-                    patches.append(patch)
-                    coordinates.append((y, x))
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(mask_path), exist_ok=True)
         
-        return patches, coordinates
-
-    def cross_validate_patches(self, 
-                             patches: List[np.ndarray],
-                             labels: List[int]) -> List[Dict]:
-        """
-        Perform k-fold cross-validation on patches
+        # Save mask
+        tiff.imwrite(mask_path, mask)
         
-        Args:
-            patches: List of image patches
-            labels: List of corresponding labels
-            
-        Returns:
-            List of dictionaries containing fold information
-        """
-        kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=42)
-        fold_results = []
+        # Calculate tissue ratio
+        tissue_ratio = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
         
-        for fold, (train_idx, val_idx) in enumerate(kf.split(patches)):
-            fold_info = {
-                'fold': fold + 1,
-                'train_patches': [patches[i] for i in train_idx],
-                'val_patches': [patches[i] for i in val_idx],
-                'train_labels': [labels[i] for i in train_idx],
-                'val_labels': [labels[i] for i in val_idx]
-            }
-            fold_results.append(fold_info)
+        # Visualize if visualizer is available
+        if self.visualizer:
+            self.visualizer.visualize_preprocessing(
+                original_image=image,
+                segmentation_mask=mask,
+                patches=[],  # Will be filled by patch extractor
+                coordinates=[],
+                image_name=f"{split}_{label}_{base_name}"
+            )
         
-        return fold_results
-
-    def optimize_parameters(self,
-                          image: np.ndarray,
-                          true_mask: np.ndarray) -> Dict:
-        """
-        Optimize segmentation parameters using grid search
-        
-        Args:
-            image: Input RGB image
-            true_mask: Ground truth tissue mask
-            
-        Returns:
-            Dictionary of optimal parameters
-        """
-        param_grid = {
-            'min_tissue_threshold': [0.6, 0.7, 0.8],
-            'patch_size': [224, 256, 288],
-            'patch_overlap': [0.3, 0.5, 0.7]
+        return {
+            'original_image': base_name,
+            'mask_name': mask_name,
+            'label': label,
+            'split': split,
+            'threshold': threshold,
+            'tissue_ratio': tissue_ratio
         }
-        
-        best_params = None
-        best_score = -1
-        
-        for min_thresh in param_grid['min_tissue_threshold']:
-            for size in param_grid['patch_size']:
-                for overlap in param_grid['patch_overlap']:
-                    self.min_tissue_threshold = min_thresh
-                    self.patch_size = size
-                    self.patch_overlap = overlap
-                    
-                    # Segment tissue
-                    pred_mask = self.segment_tissue(image)
-                    
-                    # Calculate IoU score
-                    intersection = np.logical_and(pred_mask, true_mask)
-                    union = np.logical_or(pred_mask, true_mask)
-                    iou_score = np.sum(intersection) / np.sum(union)
-                    
-                    if iou_score > best_score:
-                        best_score = iou_score
-                        best_params = {
-                            'min_tissue_threshold': min_thresh,
-                            'patch_size': size,
-                            'patch_overlap': overlap
-                        }
-        
-        return best_params 
+
+def main():
+    # Base directories
+    base_dir = "data"
+    raw_dir = os.path.join(base_dir, "raw")
+    processed_dir = os.path.join(base_dir, "processed")
+    
+    # Create segmenter instance
+    segmenter = TissueSegmenter()
+    
+    # Get list of images
+    image_paths = []
+    for split in ['train', 'val', 'test']:
+        split_dir = os.path.join(raw_dir, split)
+        if os.path.exists(split_dir):
+            for label in os.listdir(split_dir):
+                label_dir = os.path.join(split_dir, label)
+                if os.path.isdir(label_dir):
+                    for image_file in os.listdir(label_dir):
+                        if image_file.endswith('.tif'):
+                            image_paths.append({
+                                'path': os.path.join(label_dir, image_file),
+                                'label': label,
+                                'split': split
+                            })
+    
+    # Process images
+    mask_info = []
+    for img_info in image_paths:
+        logger.info(f"Processing {img_info['path']}")
+        result = segmenter.process_image(
+            img_info['path'],
+            processed_dir,
+            img_info['label'],
+            img_info['split']
+        )
+        if result:
+            mask_info.append(result)
+    
+    # Save mask information
+    mask_df = pd.DataFrame(mask_info)
+    mask_info_path = os.path.join(processed_dir, "mask_info.csv")
+    mask_df.to_csv(mask_info_path, index=False)
+    logger.info(f"Saved mask information to {mask_info_path}")
+    
+    # Print summary
+    print("\nTissue Segmentation Summary:")
+    for split in ['train', 'val', 'test']:
+        split_masks = mask_df[mask_df['split'] == split]
+        print(f"\n{split.capitalize()} Set:")
+        for label in mask_df['label'].unique():
+            count = len(split_masks[split_masks['label'] == label])
+            avg_tissue_ratio = split_masks[split_masks['label'] == label]['tissue_ratio'].mean()
+            print(f"  {label}: {count} masks")
+            print(f"    Avg tissue ratio: {avg_tissue_ratio:.2f}")
+        print(f"  Total: {len(split_masks)} masks")
+    
+    print(f"\nTotal masks created: {len(mask_df)}")
+    print(f"Average tissue ratio across all masks: {mask_df['tissue_ratio'].mean():.2f}")
+
+if __name__ == "__main__":
+    main()

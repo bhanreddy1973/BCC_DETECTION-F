@@ -55,9 +55,9 @@ class EfficientNetFeatureExtractor:
             Extracted features
         """
         try:
-            # Calculate number of chunks
+            # Calculate optimal chunk size based on available memory
             n_images = len(images)
-            chunk_size = min(1000, n_images)  # Process at most 1000 images at a time
+            chunk_size = min(2000, n_images)  # Increased from 1000 to 2000 given available RAM
             n_chunks = (n_images + chunk_size - 1) // chunk_size
             
             self.logger.info(f"Processing {n_images} images in {n_chunks} chunks of size {chunk_size}")
@@ -76,8 +76,14 @@ class EfficientNetFeatureExtractor:
                 # Preprocess images
                 preprocessed = tf.keras.applications.efficientnet.preprocess_input(chunk)
                 
-                # Extract features
-                features = self.model.predict(preprocessed, batch_size=self.batch_size)
+                # Extract features with larger batch size
+                features = self.model.predict(
+                    preprocessed, 
+                    batch_size=min(256, len(chunk)),  # Increased batch size, but capped at chunk size
+                    verbose=1,
+                    workers=24,  # Use more CPU cores for parallel processing
+                    use_multiprocessing=True
+                )
                 all_features.append(features)
                 
                 # Clear memory
@@ -150,4 +156,4 @@ class EfficientNetFeatureExtractor:
         Returns:
             Feature importance scores
         """
-        return self.pca.explained_variance_ratio_ 
+        return self.pca.explained_variance_ratio_

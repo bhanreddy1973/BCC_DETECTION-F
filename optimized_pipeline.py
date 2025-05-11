@@ -1,273 +1,302 @@
 import os
 import numpy as np
 import cv2
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from sklearn.model_selection import KFold
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import random
-from PIL import Image
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import segmentation_models_pytorch as smp
-from sklearn.model_selection import train_test_split
-import shutil
 import logging
 from pathlib import Path
+import tifffile
+import json
+import time
+from datetime import datetime
+import gc
+from tqdm import tqdm
+from src.preprocessing.tissue_segmentation import TissueSegmenter
+from src.preprocessing.patch_extraction import PatchExtractor
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / f"preprocessing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# Set random seeds for reproducibility
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# Update paths
+BASE_DIR = Path("data/raw")
+PROCESSED_DIR = Path("data/processed")
 
-set_seed()
-
-# Define paths
-BASE_DIR = Path("data")
-TRAIN_DIR = BASE_DIR / "train"
-VAL_DIR = BASE_DIR / "val"
-TEST_DIR = BASE_DIR / "test"
-
-# Create directories if they don't exist
-for directory in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
-
-# Define image transformations
-def get_transforms():
-    train_transform = A.Compose([
-        A.RandomRotate90(p=0.5),
-        A.Flip(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=45, p=0.5),
-        A.OneOf([
-            A.ElasticTransform(alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03, p=0.5),
-            A.GridDistortion(p=0.5),
-            A.OpticalDistortion(distort_limit=1, shift_limit=0.5, p=0.5),
-        ], p=0.3),
-        A.OneOf([
-            A.RandomBrightnessContrast(p=0.5),
-            A.RandomGamma(p=0.5),
-            A.CLAHE(p=0.5),
-        ], p=0.3),
-        A.OneOf([
-            A.GaussNoise(p=0.5),
-            A.GaussianBlur(p=0.5),
-            A.MotionBlur(p=0.5),
-        ], p=0.3),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    val_transform = A.Compose([
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    return train_transform, val_transform
-
-# Custom Dataset class
-class BCCDataset(Dataset):
-    def __init__(self, image_paths, mask_paths=None, transform=None, is_train=True):
-        self.image_paths = image_paths
-        self.mask_paths = mask_paths
-        self.transform = transform
-        self.is_train = is_train
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = cv2.imread(str(img_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+def validate_and_save_image(img: np.ndarray, save_path: Path) -> bool:
+    """Validate image before saving and ensure it's in the correct format."""
+    try:
+        if img is None:
+            return False
         
-        if self.mask_paths is not None:
-            mask_path = self.mask_paths[idx]
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            mask = (mask > 0).astype(np.float32)
-            
-            if self.transform:
-                augmented = self.transform(image=image, mask=mask)
-                image = augmented['image']
-                mask = augmented['mask']
-            
-            return image, mask
+        # Ensure image is in uint8 format
+        if img.dtype != np.uint8:
+            img = (img * 255).astype(np.uint8)
+        
+        # Ensure image is 2D for masks
+        if len(img.shape) > 2 and img.shape[2] > 1:
+            img = img[:, :, 0]
+        
+        # Use tifffile for saving large images
+        if img.size > 100000000:  # If image is larger than 100MP
+            tifffile.imwrite(str(save_path.with_suffix('.tif')), img)
+            return True
         else:
-            if self.transform:
-                augmented = self.transform(image=image)
-                image = augmented['image']
+            # Try to save with OpenCV for smaller images
+            cv2.imwrite(str(save_path), img)
             
-            return image
-
-# Define the model
-class BCCModel(nn.Module):
-    def __init__(self, encoder_name="resnet50", encoder_weights="imagenet"):
-        super().__init__()
-        self.model = smp.Unet(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=3,
-            classes=1,
-            activation=None
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-# Training function
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0
-    
-    for images, masks in tqdm(train_loader, desc="Training"):
-        images = images.to(device)
-        masks = masks.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, masks)
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    return total_loss / len(train_loader)
-
-# Validation function
-def validate_epoch(model, val_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    
-    with torch.no_grad():
-        for images, masks in tqdm(val_loader, desc="Validation"):
-            images = images.to(device)
-            masks = masks.to(device)
+            # Verify the saved image can be read back
+            verification = cv2.imread(str(save_path))
+            if verification is None:
+                logger.error(f"Failed to verify saved image: {save_path}")
+                if save_path.exists():
+                    save_path.unlink()
+                return False
             
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-            total_loss += loss.item()
-    
-    return total_loss / len(val_loader)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving image {save_path}: {str(e)}")
+        if save_path.exists():
+            save_path.unlink()
+        return False
 
-# Main training function
-def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=50, patience=10):
-    best_val_loss = float('inf')
-    patience_counter = 0
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss = validate_epoch(model, val_loader, criterion, device)
+def process_image_in_chunks(image_path: Path, output_dir: Path, segmenter: TissueSegmenter, patch_extractor: PatchExtractor):
+    """Process a large TIFF image in chunks to manage memory."""
+    try:
+        logger.info(f"Processing image: {image_path}")
         
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        # Check if already processed
+        metadata_path = output_dir / "patches" / f"{image_path.stem}_metadata.json"
+        if metadata_path.exists():
+            logger.info(f"Skipping {image_path.name} - already processed")
+            return True
+            
+        # Create output directories
+        patches_dir = output_dir / "patches"
+        segmented_dir = output_dir / "segmented"
+        patches_dir.mkdir(parents=True, exist_ok=True)
+        segmented_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        # Check if output directories are writable
+        if not os.access(str(patches_dir), os.W_OK) or not os.access(str(segmented_dir), os.W_OK):
+            raise PermissionError(f"No write permission for output directories")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_model.pth")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info("Early stopping triggered")
-                break
-    
-    return train_losses, val_losses
+        # Use tifffile to read large TIFF images
+        with tifffile.TiffFile(image_path) as tif:
+            image = tif.asarray()
+            
+        if image is None:
+            raise ValueError(f"Failed to load image: {image_path}")
+            
+        # Convert to RGB if needed
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[-1] == 4:  # RGBA
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+            
+        # Process in smaller chunks
+        chunk_size = (1024, 1024)  # Adjust based on available memory
+        height, width = image.shape[:2]
+        all_patches = []
+        all_coords = []
+        all_metrics = []
+        
+        # Perform tissue segmentation on downsampled image for memory efficiency
+        scale = 0.25  # 1/4 resolution for initial segmentation
+        small_image = cv2.resize(image, None, fx=scale, fy=scale)
+        mask, _ = segmenter.segment_tissue(small_image)
+        mask = cv2.resize(mask.astype(np.uint8), (width, height)) > 0
+        
+        # Save segmentation mask with validation
+        mask_path = segmented_dir / f"{image_path.stem}_mask.png"
+        if not validate_and_save_image(mask.astype(np.uint8) * 255, mask_path):
+            raise ValueError(f"Failed to save valid mask for {image_path.name}")
+        
+        # Process image in chunks where tissue is present
+        total_tissue_pixels = np.sum(mask)
+        if total_tissue_pixels == 0:
+            logger.warning(f"No tissue detected in {image_path.name}")
+            return False
+            
+        for y in range(0, height, chunk_size[0]):
+            for x in range(0, width, chunk_size[1]):
+                # Extract chunk coordinates
+                y2 = min(y + chunk_size[0], height)
+                x2 = min(x + chunk_size[1], width)
+                
+                # Check if chunk contains tissue
+                if not mask[y:y2, x:x2].any():
+                    continue
+                
+                # Process chunk
+                chunk = image[y:y2, x:x2]
+                chunk_mask = mask[y:y2, x:x2]
+                
+                # Extract patches from chunk
+                patches, coordinates, metrics = patch_extractor.extract_patches(chunk, chunk_mask)
+                
+                if patches is not None and len(patches) > 0:
+                    # Adjust coordinates to full image space
+                    coordinates = [(coord[0] + x, coord[1] + y) for coord in coordinates]
+                    
+                    all_patches.extend(patches)
+                    all_coords.extend(coordinates)
+                    all_metrics.extend(metrics)
+                
+                # Clear chunk from memory
+                del chunk, patches, coordinates, metrics
+                gc.collect()
+        
+        if len(all_patches) == 0:
+            logger.warning(f"No valid patches extracted from {image_path.name}")
+            return False
+            
+        # Convert lists to numpy arrays
+        all_patches = np.array(all_patches)
+        all_coords = np.array(all_coords)
+        
+        # Save patches in batches
+        batch_size = 1000
+        num_batches = (len(all_patches) + batch_size - 1) // batch_size
+        
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(all_patches))
+            
+            batch_patches = all_patches[start_idx:end_idx]
+            batch_coords = all_coords[start_idx:end_idx]
+            batch_metrics = all_metrics[start_idx:end_idx]
+            
+            # Save batch with validation
+            patches_path = patches_dir / f"{image_path.stem}_patches_{i}.npy"
+            coords_path = patches_dir / f"{image_path.stem}_coords_{i}.npy"
+            metrics_path = patches_dir / f"{image_path.stem}_metrics_{i}.json"
+            
+            try:
+                np.save(str(patches_path), batch_patches)
+                np.save(str(coords_path), batch_coords)
+                with open(metrics_path, 'w') as f:
+                    json.dump(batch_metrics, f, indent=2)
+            except Exception as e:
+                logger.error(f"Error saving batch {i}: {str(e)}")
+                # Clean up failed batch
+                for path in [patches_path, coords_path, metrics_path]:
+                    if path.exists():
+                        path.unlink()
+                continue
+        
+        # Save metadata
+        metadata = {
+            'image_name': image_path.name,
+            'num_patches': len(all_patches),
+            'num_batches': num_batches,
+            'patch_size': patch_extractor.patch_size,
+            'timestamp': datetime.now().isoformat(),
+            'processing_info': {
+                'chunk_size': chunk_size,
+                'initial_segmentation_scale': scale,
+                'total_tissue_area': int(np.sum(mask)),
+                'total_patches': len(all_patches)
+            }
+        }
+        
+        metadata_path = patches_dir / f"{image_path.stem}_metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Successfully processed {image_path.name} - extracted {len(all_patches)} patches")
+        return True
+            
+    except Exception as e:
+        logger.error(f"Error processing {image_path}: {str(e)}", exc_info=True)
+        # Clean up any partial results
+        try:
+            for path in patches_dir.glob(f"{image_path.stem}*"):
+                path.unlink()
+            for path in segmented_dir.glob(f"{image_path.stem}*"):
+                path.unlink()
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up after failed processing: {str(cleanup_error)}")
+        return False
+    finally:
+        # Clear memory
+        gc.collect()
 
-# Function to split data
-def split_data(image_dir, mask_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
-    image_paths = sorted(list(Path(image_dir).glob("*.jpg")))
-    mask_paths = sorted(list(Path(mask_dir).glob("*.png")))
+def preprocess_dataset(data_dir: Path, output_dir: Path):
+    """Preprocess all images in the dataset."""
+    logger.info("=== Starting Preprocessing Pipeline ===")
     
-    # Ensure we have matching pairs
-    assert len(image_paths) == len(mask_paths), "Number of images and masks don't match"
-    
-    # Split the data
-    train_size = int(len(image_paths) * train_ratio)
-    val_size = int(len(image_paths) * val_ratio)
-    
-    indices = list(range(len(image_paths)))
-    random.shuffle(indices)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-    
-    train_images = [image_paths[i] for i in train_indices]
-    train_masks = [mask_paths[i] for i in train_indices]
-    
-    val_images = [image_paths[i] for i in val_indices]
-    val_masks = [mask_paths[i] for i in val_indices]
-    
-    test_images = [image_paths[i] for i in test_indices]
-    test_masks = [mask_paths[i] for i in test_indices]
-    
-    return (train_images, train_masks), (val_images, val_masks), (test_images, test_masks)
-
-# Main execution
-if __name__ == "__main__":
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    
-    # Define paths
-    image_dir = "data/images"
-    mask_dir = "data/masks"
-    
-    # Split data
-    (train_images, train_masks), (val_images, val_masks), (test_images, test_masks) = split_data(image_dir, mask_dir)
-    
-    # Get transforms
-    train_transform, val_transform = get_transforms()
-    
-    # Create datasets
-    train_dataset = BCCDataset(train_images, train_masks, transform=train_transform)
-    val_dataset = BCCDataset(val_images, val_masks, transform=val_transform)
-    test_dataset = BCCDataset(test_images, test_masks, transform=val_transform)
-    
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4)
-    
-    # Initialize model
-    model = BCCModel().to(device)
-    
-    # Define loss function and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # Train model
-    train_losses, val_losses = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        device=device
+    # Initialize preprocessing components
+    segmenter = TissueSegmenter(
+        otsu_threshold=None,
+        min_tissue_area=1000,
+        kernel_size=5
     )
     
-    # Plot training history
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig('training_history.png')
-    plt.close() 
+    patch_extractor = PatchExtractor(
+        patch_size=224,
+        stride=112,  # 50% overlap
+        min_tissue_ratio=0.7
+    )
+    
+    # Process images sequentially to manage memory
+    successful = 0
+    failed = 0
+    total_images = 0
+    
+    for split in ["train", "val", "test"]:
+        split_dir = data_dir / split
+        for class_name in ["bcc_high_risk", "bcc_low_risk", "non_malignant"]:
+            class_dir = split_dir / class_name
+            if not class_dir.exists():
+                continue
+            
+            image_paths = list(class_dir.glob("*.tif"))
+            total_images += len(image_paths)
+            
+            output_class_dir = output_dir / split / class_name
+            output_class_dir.mkdir(parents=True, exist_ok=True)
+            
+            logger.info(f"Processing {split}/{class_name} images...")
+            for image_path in tqdm(image_paths, desc=f"{split}/{class_name}"):
+                if process_image_in_chunks(image_path, output_class_dir, segmenter, patch_extractor):
+                    successful += 1
+                else:
+                    failed += 1
+                    
+                # Clear memory between images
+                gc.collect()
+    
+    # Generate summary
+    summary = {
+        'total_images': total_images,
+        'successful': successful,
+        'failed': failed,
+        'success_rate': (successful / total_images * 100) if total_images > 0 else 0
+    }
+    
+    with open(output_dir / 'preprocessing_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    logger.info("=== Processing Summary ===")
+    logger.info(f"Total images: {total_images}")
+    logger.info(f"Successfully processed: {successful}")
+    logger.info(f"Failed to process: {failed}")
+    logger.info(f"Success rate: {summary['success_rate']:.2f}%")
+
+if __name__ == "__main__":
+    try:
+        logger.info("Starting BCC Detection preprocessing pipeline...")
+        preprocess_dataset(BASE_DIR, PROCESSED_DIR)
+    except Exception as e:
+        logger.error("Pipeline failed with error", exc_info=True)
+    finally:
+        logger.info("Pipeline execution completed")

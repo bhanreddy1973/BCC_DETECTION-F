@@ -5,6 +5,32 @@ import tifffile
 import pandas as pd
 from typing import List, Tuple, Dict
 import logging
+import cv2
+
+def load_image(image_path: str) -> np.ndarray:
+    """
+    Load and preprocess image
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Loaded image as numpy array
+    """
+    try:
+        # Load image with tifffile
+        image = tifffile.imread(image_path)
+        
+        # Convert to RGB if needed
+        if len(image.shape) == 2:  # Grayscale
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[-1] == 4:  # RGBA
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+            
+        return image
+    except Exception as e:
+        logging.error(f"Error loading image {image_path}: {str(e)}")
+        raise
 
 def load_tiff_image(image_path: str) -> np.ndarray:
     """
@@ -67,22 +93,30 @@ def load_labels(labels_path: str) -> np.ndarray:
     df = pd.read_csv(labels_path)
     return df['label'].values
 
-def save_features(features: np.ndarray,
-                 image_name: str,
-                 output_dir: str) -> None:
+def save_features(features: np.ndarray, image_name: str, output_dir: str) -> None:
     """
-    Save extracted features
+    Save extracted features to disk
     
     Args:
-        features: Feature vectors
-        image_name: Name of source image
-        output_dir: Directory to save features
+        features: Feature array to save
+        image_name: Name/ID of the source image
+        output_dir: Base directory to save features
     """
-    features_dir = os.path.join(output_dir, 'features')
-    os.makedirs(features_dir, exist_ok=True)
-    
-    features_path = os.path.join(features_dir, f"{image_name}_features.npy")
-    np.save(features_path, features)
+    try:
+        # Create full path including split/class subdirectories
+        split_dir = os.path.dirname(image_name)  # e.g. 'test/bcc_high_risk'
+        features_dir = os.path.join(output_dir, split_dir)
+        os.makedirs(features_dir, exist_ok=True)
+        
+        # Create features filename from image ID
+        image_id = os.path.basename(image_name)  # e.g. '361ac0cd4eca3818a749fe57020e0caa'
+        features_path = os.path.join(features_dir, f"{image_id}_features.npy")
+        
+        # Save features
+        np.save(features_path, features)
+    except Exception as e:
+        logging.error(f"Error saving features for {image_name}: {str(e)}")
+        raise
 
 def load_features(features_dir: str) -> Dict[str, np.ndarray]:
     """
@@ -131,4 +165,4 @@ def load_predictions(predictions_dir: str) -> Dict[str, Dict]:
     for pred_path in Path(predictions_dir).glob('*.npy'):
         image_name = pred_path.stem.replace('_predictions', '')
         predictions[image_name] = np.load(pred_path, allow_pickle=True).item()
-    return predictions 
+    return predictions
